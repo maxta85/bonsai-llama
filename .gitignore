@@ -7,3 +7,8 @@ __pycache__/
 *.egg-info/
 .venv/
 .pytest_cache/
+training-data/
+.hf_cache/
+bonsai-poc/
+bonsai-real-run/
+bonsai-sft-test/
