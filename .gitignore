@@ -1,0 +1,9 @@
+build/
+third_party/
+*.gguf
+*.f32
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+.pytest_cache/

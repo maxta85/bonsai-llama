@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bonsai-tensor"
+version = "0.1.0"
+description = "Packed 1-bit (Q1_0) and ternary 1.58-bit (Q2_0) weight tensors for Bonsai-style LLMs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+train = [
+    "torch>=2.2",
+    "transformers>=4.44",
+    "datasets>=2.19",
+    "accelerate>=0.30",
+    "safetensors>=0.4",
+    "sentencepiece>=0.2",
+    "gguf>=0.10",
+    "tqdm>=4.66",
+]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+bonsai-quantize = "bonsai_tensor.cli:quantize_main"
+bonsai-distill = "training.distill:main"
+
+[tool.setuptools.packages.find]
+where = ["python", "training"]
+include = ["bonsai_tensor*", "training*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
