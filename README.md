@@ -37,10 +37,25 @@ cmake --build build -j
 # 3. llama.cpp fork (full inference engine, optional)
 ./scripts/setup_llamacpp.sh        # clones PrismML-Eng/llama.cpp @ prism
 cmake --build build/llamacpp -j
+
+# 4. bitnet.cpp (official BitNet b1.58 engine, optional)
+./scripts/setup_bitnet_cpp.sh     # clones microsoft/bitnet, builds bitnet.cpp
 ```
 
 See [`docs/`](docs/) for the whitepaper index, the reproduction guide, and the
 architecture overview.
+
+## Inference engines
+
+Three run paths, depending on which model you want to run:
+
+| Engine | Script | Runs |
+| --- | --- | --- |
+| `cpp/bonsai_infer` | `cmake --build build` | Reference Q1_0/Q2_0 kernel sanity checks (this repo) |
+| PrismML-Eng/llama.cpp fork | `scripts/setup_llamacpp.sh` | Bonsai / Ternary-Bonsai GGUF models (Q1_0, Q2_0) |
+| microsoft/bitnet (bitnet.cpp) | `scripts/setup_bitnet_cpp.sh` | `microsoft/bitnet-b1.58-2B-4T` (official BitNet 2B) |
+
+See [`docs/bitnet-2b.md`](docs/bitnet-2b.md) for the BitNet 2B reference model.
 
 ## Status
 
@@ -48,7 +63,8 @@ Research prototype. The Python tensor library and C++ kernels are self-contained
 tested. The training pipeline is a working QAT scaffold that reproduces the BitNet b1.58
 `BitLinear` + straight-through estimator; full reproduction of Bonsai's proprietary
 training recipe requires the data and compute described in the Prism ML whitepaper (see
-`docs/whitepapers/`).
+`docs/whitepapers/`). The official `microsoft/bitnet-b1.58-2B-4T` is included as a
+reference target and runnable via bitnet.cpp.
 
 ## License
 

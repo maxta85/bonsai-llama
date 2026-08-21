@@ -3,6 +3,13 @@
 Loss = alpha * CE(student, labels) + (1 - alpha) * KL(student || teacher)
 with temperature `T` on the KL term, following Hinton et al. (2015) and the
 "Training 1.58bit LLMs via Distillation" recipe.
+
+Reference teacher
+-----------------
+`microsoft/bitnet-b1.58-2B-4T-bf16` (the BF16 master-weights variant of the
+official BitNet b1.58 2B model) can be used as a *ternary-aware* teacher: it
+already produces ternary logits, so distilling into it transfers the
+quantized representation directly. See docs/bitnet-2b.md.
 """
 
 from __future__ import annotations
@@ -58,6 +65,10 @@ def train_step(student, teacher, input_ids, labels, optimizer, *,
 def main():
     ap = argparse.ArgumentParser(description="Distill an FP model into 1-bit/ternary")
     ap.add_argument("--teacher", required=True, help="HF model id or path for the teacher")
+    ap.add_argument("--reference", default=None,
+                    help="optional reference ternary model (e.g. "
+                         "microsoft/bitnet-b1.58-2B-4T-bf16) for sanity-check "
+                         "logit comparison; not used in the loss")
     ap.add_argument("--mode", choices=["1b", "1.58b"], default="1.58b")
     ap.add_argument("--dataset", default="wikitext", help="dataset name")
     ap.add_argument("--epochs", type=int, default=1)

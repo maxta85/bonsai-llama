@@ -36,6 +36,7 @@ Bonsai.
 | BitNet official code + training tips / FAQ | https://github.com/microsoft/bitnet |
 | Training Tips, Code, FAQ (PDF) | https://github.com/microsoft/unilm/blob/master/bitnet/The-Era-of-1-bit-LLMs__Training_Tips_Code_FAQ.pdf |
 | BitNet b1.58-2B-4T (official 2B model, 4T tokens) | https://huggingface.co/microsoft/BitNet-b1.58-2B-4T |
+| BitNet b1.58 2B4T Technical Report (arXiv 2504.12285) | https://arxiv.org/abs/2504.12285 |
 | bitnet.cpp (official 1.58-bit inference engine) | https://github.com/microsoft/bitnet (bitnet.cpp) |
 
 **Key training recipe (BitNet b1.58):**

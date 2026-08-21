@@ -21,10 +21,12 @@ bonsai-llama/
 │   └── export_gguf.py         # Export trained weights -> GGUF Q1_0/Q2_0
 ├── docs/
 │   ├── whitepapers/README.md  # All whitepapers + references
+│   ├── bitnet-2b.md           # Microsoft BitNet b1.58 2B4T reference model
 │   ├── REPRODUCTION.md        # Step-by-step reproduction guide
 │   └── ARCHITECTURE.md        # This file
 ├── scripts/
-│   └── setup_llamacpp.sh      # Clone + build the PrismML-Eng/llama.cpp fork
+│   ├── setup_llamacpp.sh      # Clone + build the PrismML-Eng/llama.cpp fork
+│   └── setup_bitnet_cpp.sh    # Clone + build microsoft/bitnet (bitnet.cpp)
 ├── tests/test_tensors.py      # Python tensor round-trip tests
 ├── pyproject.toml
 ├── CMakeLists.txt (root)      # Top-level: builds cpp/ and wires llamacpp/
@@ -55,14 +57,19 @@ bonsai-llama/
         └────────────────────────┘
 ```
 
-## Why two inference paths?
+## Why three inference paths?
 
 - **`cpp/`** is a tiny, dependency-free reference implementation of the
   Q1_0/Q2_0 dequant + matmul. It exists to make the format concrete and
   testable without pulling in all of llama.cpp. It is *not* fast.
-- **The PrismML-Eng/llama.cpp fork** is the real inference engine: optimized
-  NEON/AVX/Metal/CUDA/Vulkan kernels for Q1_0 and Q2_0, full transformer,
-  tokenizer, server. `scripts/setup_llamacpp.sh` wires it in as a submodule.
+- **The PrismML-Eng/llama.cpp fork** is the real inference engine for the
+  Bonsai / Ternary-Bonsai GGUF models: optimized NEON/AVX/Metal/CUDA/Vulkan
+  kernels for Q1_0 and Q2_0, full transformer, tokenizer, server.
+  `scripts/setup_llamacpp.sh` wires it in.
+- **microsoft/bitnet (bitnet.cpp)** is the official engine for the BitNet
+  b1.58 2B model (`microsoft/bitnet-b1.58-2B-4T`): optimized I2_S / TL1
+  CPU kernels that deliver the actual speed/energy wins from the paper.
+  `scripts/setup_bitnet_cpp.sh` wires it in. See `docs/bitnet-2b.md`.
 
 ## Tensor type contract
 
