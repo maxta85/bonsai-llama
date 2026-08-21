@@ -1,25 +1,13 @@
-"""Distillation trainer: student (BitLinear) learns from a frozen FP teacher.
+"""Distillation + SFT trainer for ternary/bitnet models.
 
-Loss = alpha * CE(student, labels) + (1 - alpha) * KL(student || teacher)
-with temperature `T` on the KL term, following Hinton et al. (2015) and the
-"Training 1.58bit LLMs via Distillation" recipe.
+Two modes:
+  1. Pre-training distillation (default): student learns from teacher's
+     logits on raw text. Loss = alpha*CE + (1-alpha)*KL.
+  2. SFT mode (--sft): student learns from instruction-response pairs.
+     Loss = CE on assistant tokens only (labels masked on user/system).
 
-Two GPU modes
--------------
-Single-GPU (default, faster for small models):
-  Both teacher and student on the same GPU. Uses full-vocab KL (exact, no
-  approximation). Best when both models fit in VRAM — e.g. Qwen3-1.7B
-  teacher + Qwen3-0.6B student on a 96GB card.
-
-Multi-GPU (for when the student won't fit alongside the teacher):
-  Teacher on a large GPU (e.g. 96GB Blackwell), student on a smaller one
-  (e.g. 12GB 3060). Uses top-k logit distillation: transfers only the top-k
-  teacher probabilities per position (~50x less PCIe traffic than full vocab).
-
-Reference teacher
------------------
-`microsoft/bitnet-b1.58-2B-4T-bf16` can be used as a ternary-aware teacher.
-See docs/bitnet-2b.md.
+Single-GPU mode (default): both models on same GPU, full-vocab KL.
+Multi-GPU mode: teacher on big GPU, student on small GPU, top-k KL.
 """
 
 from __future__ import annotations
@@ -46,10 +34,7 @@ def distillation_loss_full(
     alpha: float = 0.5,
     temperature: float = 2.0,
 ) -> torch.Tensor:
-    """CE + full-vocab temperature-scaled KL (exact, no approximation).
-
-    Use when teacher and student are on the same device.
-    """
+    """CE + full-vocab temperature-scaled KL (exact, no approximation)."""
     ce = F.cross_entropy(
         student_logits.reshape(-1, student_logits.size(-1)),
         labels.reshape(-1),
@@ -74,10 +59,7 @@ def distillation_loss_topk(
     alpha: float = 0.5,
     temperature: float = 2.0,
 ) -> torch.Tensor:
-    """CE + top-k temperature-scaled KL (approximation for multi-GPU).
-
-    Only the teacher's top-k logits are used, renormalized to sum to 1.
-    """
+    """CE + top-k temperature-scaled KL (approximation for multi-GPU)."""
     ce = F.cross_entropy(
         student_logits.reshape(-1, student_logits.size(-1)),
         labels.reshape(-1),
@@ -91,24 +73,35 @@ def distillation_loss_topk(
     return alpha * ce + (1.0 - alpha) * kl
 
 
+def sft_loss(student_logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Pure cross-entropy on assistant tokens (labels masked with -100)."""
+    return F.cross_entropy(
+        student_logits.reshape(-1, student_logits.size(-1)),
+        labels.reshape(-1),
+        ignore_index=-100,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Teacher forwards
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def teacher_forward_full(teacher: nn.Module, input_ids: torch.Tensor):
+def teacher_forward_full(teacher: nn.Module, input_ids: torch.Tensor,
+                         attention_mask: torch.Tensor | None = None):
     """Run teacher, return full logits (B, T, V). Same-device only."""
     teacher.eval()
-    out = teacher(input_ids)
+    out = teacher(input_ids, attention_mask=attention_mask)
     return out.logits if hasattr(out, "logits") else out[0]
 
 
 @torch.no_grad()
 def teacher_forward_topk(teacher: nn.Module, input_ids: torch.Tensor,
-                         topk: int = 50, temperature: float = 2.0):
+                         topk: int = 50, temperature: float = 2.0,
+                         attention_mask: torch.Tensor | None = None):
     """Run teacher, return top-k indices + renormalized probs. Multi-GPU."""
     teacher.eval()
-    out = teacher(input_ids)
+    out = teacher(input_ids, attention_mask=attention_mask)
     logits = out.logits if hasattr(out, "logits") else out[0]
     scaled = logits / temperature
     probs = F.softmax(scaled, dim=-1)
@@ -131,12 +124,13 @@ def get_lr(step, base_lr, warmup_steps, total_steps):
 
 def train(
     student: nn.Module,
-    teacher: nn.Module,
+    teacher: nn.Module | None,
     dataloader,
     optimizer,
     *,
     teacher_device: torch.device,
     student_device: torch.device,
+    sft_mode: bool = False,
     topk: int = 50,
     alpha: float = 0.5,
     temperature: float = 2.0,
@@ -149,26 +143,29 @@ def train(
     out_dir: str = "bonsai-distilled",
     tokenizer=None,
 ):
-    """Run the distillation training loop.
+    """Run the training loop.
 
-    Single-GPU mode (teacher_device == student_device):
-        Full-vocab KL, no cross-device transfer. Fastest for small models.
-    Multi-GPU mode (different devices):
-        Top-k KL to minimize PCIe transfer.
+    SFT mode: pure CE on assistant tokens, no teacher needed.
+    Distillation mode: CE + KL from teacher logits.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     student.train()
     student.to(student_device)
-    teacher.eval()
-    teacher.to(teacher_device)
-    for p in teacher.parameters():
-        p.requires_grad = False
 
-    single_gpu = (teacher_device == student_device)
-    if single_gpu:
-        print("Single-GPU mode: full-vocab KL (exact distillation, no transfer)")
+    if teacher is not None:
+        teacher.eval()
+        teacher.to(teacher_device)
+        for p in teacher.parameters():
+            p.requires_grad = False
+
+    single_gpu = (teacher is not None and teacher_device == student_device)
+
+    if sft_mode:
+        print("SFT mode: pure CE on assistant tokens (loss-masked)")
+    elif single_gpu:
+        print("Single-GPU mode: full-vocab KL (exact distillation)")
     else:
         print(f"Multi-GPU mode: top-{topk} KL (teacher={teacher_device}, "
               f"student={student_device})")
@@ -184,31 +181,45 @@ def train(
 
         input_ids = batch["input_ids"]  # (B, T)
         labels = batch["labels"]        # (B, T)
+        attention_mask = batch.get("attention_mask")  # (B, T) or None
 
-        if single_gpu:
+        if sft_mode:
+            # --- SFT: pure CE on assistant tokens ---
+            ids = input_ids.to(student_device)
+            lbls = labels.to(student_device)
+            am = attention_mask.to(student_device) if attention_mask is not None else None
+            s_out = student(ids, attention_mask=am)
+            s_logits = s_out.logits if hasattr(s_out, "logits") else s_out[0]
+            loss = sft_loss(s_logits, lbls)
+
+        elif single_gpu:
             # --- Both on same device: full-vocab KL ---
             ids = input_ids.to(student_device)
             lbls = labels.to(student_device)
+            am = attention_mask.to(student_device) if attention_mask is not None else None
             with torch.no_grad():
-                t_logits = teacher_forward_full(teacher, ids)
-            s_out = student(ids)
+                t_logits = teacher_forward_full(teacher, ids, attention_mask=am)
+            s_out = student(ids, attention_mask=am)
             s_logits = s_out.logits if hasattr(s_out, "logits") else s_out[0]
             loss = distillation_loss_full(
                 s_logits, t_logits, lbls,
                 alpha=alpha, temperature=temperature,
             )
         else:
-            # --- Multi-GPU: top-k KL to minimize PCIe transfer ---
+            # --- Multi-GPU: top-k KL ---
             teacher_input = input_ids.to(teacher_device)
+            am_t = attention_mask.to(teacher_device) if attention_mask is not None else None
             topk_indices, topk_probs = teacher_forward_topk(
-                teacher, teacher_input, topk=topk, temperature=temperature
+                teacher, teacher_input, topk=topk, temperature=temperature,
+                attention_mask=am_t,
             )
             topk_indices = topk_indices.to(student_device)
             topk_probs = topk_probs.to(student_device)
 
             student_input = input_ids.to(student_device)
             student_labels = labels.to(student_device)
-            s_out = student(student_input)
+            am_s = attention_mask.to(student_device) if attention_mask is not None else None
+            s_out = student(student_input, attention_mask=am_s)
             s_logits = s_out.logits if hasattr(s_out, "logits") else s_out[0]
             loss = distillation_loss_topk(
                 s_logits, topk_indices, topk_probs, student_labels,
@@ -262,45 +273,62 @@ def train(
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Distill an FP model into 1-bit/ternary via QAT + KD",
+        description="Train ternary/bitnet models via distillation or SFT",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     # Models
-    ap.add_argument("--teacher", required=True,
-                    help="HF model id or path for the teacher (e.g. Qwen/Qwen3-1.7B)")
-    ap.add_argument("--student", default=None,
-                    help="HF model id for the student base (defaults to --teacher)")
+    ap.add_argument("--teacher", default=None,
+                    help="HF model id for teacher (required for distillation, "
+                         "not needed for --sft mode)")
+    ap.add_argument("--student", required=True,
+                    help="HF model id or path for the student base")
     ap.add_argument("--mode", choices=["1b", "1.58b"], default="1.58b",
                     help="1.58b = ternary {-1,0,+1}, 1b = binary {-1,+1}")
-    # Data
+    ap.add_argument("--init-from", default=None,
+                    help="Path to a checkpoint to initialize student from "
+                         "(e.g. a pre-trained ternary model to fine-tune)")
+
+    # SFT mode
+    ap.add_argument("--sft", action="store_true",
+                    help="Supervised fine-tuning mode (instruction-response pairs)")
+    ap.add_argument("--sft-data", default=None,
+                    help="Path to local JSONL file with SFT data "
+                         "(ShareGPT/Alpaca/messages format)")
+    ap.add_argument("--sft-dataset", default=None,
+                    choices=["alpaca", "dolly", "openhermes"],
+                    help="Use a built-in SFT dataset instead of --sft-data")
+    ap.add_argument("--system-prompt", default="You are a helpful assistant.",
+                    help="System prompt for SFT mode")
+
+    # Pre-training data
     ap.add_argument("--dataset", default="wikitext",
-                    help="HF dataset name (default: wikitext-103-raw-v1)")
+                    help="HF dataset name for pre-training (default: wikitext)")
     ap.add_argument("--text-key", default="text",
                     help="column name for text in the dataset")
-    ap.add_argument("--seq-len", type=int, default=1024)
-    ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--max-tokens", type=int, default=None,
                     help="cap on number of sequences (for quick tests)")
+
     # Training
+    ap.add_argument("--seq-len", type=int, default=1024)
+    ap.add_argument("--batch-size", type=int, default=2)
     ap.add_argument("--max-steps", type=int, default=1000)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--alpha", type=float, default=0.5,
-                    help="CE weight (1-alpha = KL weight)")
+                    help="CE weight (1-alpha = KL weight) [distillation only]")
     ap.add_argument("--temperature", type=float, default=2.0)
     ap.add_argument("--grad-accum", type=int, default=4)
     ap.add_argument("--warmup-steps", type=int, default=50)
     ap.add_argument("--topk", type=int, default=50,
                     help="top-k teacher logits for multi-GPU mode")
+
     # Devices
     ap.add_argument("--teacher-device", default="cuda:0",
                     help="device for the teacher")
     ap.add_argument("--student-device", default="cuda:0",
-                    help="device for the student. If same as teacher, uses "
-                         "single-GPU mode with full-vocab KL (exact, faster). "
-                         "Set to cuda:1 for multi-GPU (top-k transfer).")
+                    help="device for the student")
     ap.add_argument("--teacher-dtype", default="bfloat16",
-                    choices=["bfloat16", "float16", "float32"],
-                    help="teacher precision (bf16 saves VRAM)")
+                    choices=["bfloat16", "float16", "float32"])
+
     # Output
     ap.add_argument("--out", default="bonsai-distilled")
     ap.add_argument("--save-every", type=int, default=200)
@@ -309,36 +337,37 @@ def main() -> None:
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from .bit_linear import replace_linears_with_bitlinear
-    from .data import load_wikitext, load_dataset_by_name
 
     teacher_device = torch.device(args.teacher_device)
     student_device = torch.device(args.student_device)
 
-    print(f"Teacher device: {teacher_device}")
     print(f"Student device: {student_device}")
 
     # --- Load tokenizer ---
-    tok = AutoTokenizer.from_pretrained(args.teacher)
+    tok = AutoTokenizer.from_pretrained(args.student)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    # --- Load teacher (frozen) ---
-    dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16,
-                 "float32": torch.float32}
-    t_dtype = dtype_map[args.teacher_dtype]
-    print(f"Loading teacher: {args.teacher} ({args.teacher_dtype})")
-    teacher = AutoModelForCausalLM.from_pretrained(
-        args.teacher, torch_dtype=t_dtype)
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad = False
-    teacher.to(teacher_device)
-    if teacher_device.type == "cuda":
-        t_mem = torch.cuda.memory_allocated(teacher_device) / 1e9
-        print(f"  teacher on {teacher_device}, {t_mem:.1f} GB allocated")
+    # --- Load teacher (frozen) if not SFT-only ---
+    teacher = None
+    if not args.sft and args.teacher:
+        print(f"Teacher device: {teacher_device}")
+        dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16,
+                     "float32": torch.float32}
+        t_dtype = dtype_map[args.teacher_dtype]
+        print(f"Loading teacher: {args.teacher} ({args.teacher_dtype})")
+        teacher = AutoModelForCausalLM.from_pretrained(
+            args.teacher, torch_dtype=t_dtype)
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad = False
+        teacher.to(teacher_device)
+        if teacher_device.type == "cuda":
+            t_mem = torch.cuda.memory_allocated(teacher_device) / 1e9
+            print(f"  teacher on {teacher_device}, {t_mem:.1f} GB allocated")
 
-    # --- Load student (BitLinear replacement) ---
-    student_id = args.student or args.teacher
+    # --- Load student ---
+    student_id = args.init_from or args.student
     print(f"Loading student: {student_id} (fp32, BitLinear mode={args.mode})")
     student = AutoModelForCausalLM.from_pretrained(
         student_id, torch_dtype=torch.float32)
@@ -350,33 +379,60 @@ def main() -> None:
         print(f"  student on {student_device}, {s_mem:.1f} GB allocated")
 
     # --- Data ---
-    print(f"Loading dataset: {args.dataset}")
-    if args.dataset == "wikitext":
-        dl = load_wikitext(tok, batch_size=args.batch_size,
-                           seq_len=args.seq_len, max_tokens=args.max_tokens)
-    else:
-        dl = load_dataset_by_name(args.dataset, tok,
+    if args.sft:
+        from .sft import (load_sft_dataset, load_alpaca, load_dolly,
+                          load_openhermes)
+        if args.sft_data:
+            print(f"Loading SFT data: {args.sft_data}")
+            dl = load_sft_dataset(args.sft_data, tok,
                                   batch_size=args.batch_size,
                                   seq_len=args.seq_len,
-                                  text_key=args.text_key,
-                                  max_tokens=args.max_tokens)
+                                  system=args.system_prompt,
+                                  max_examples=args.max_tokens)
+        elif args.sft_dataset == "alpaca":
+            print("Loading Alpaca dataset...")
+            dl = load_alpaca(tok, batch_size=args.batch_size,
+                             seq_len=args.seq_len, max_examples=args.max_tokens)
+        elif args.sft_dataset == "dolly":
+            print("Loading Dolly 15K dataset...")
+            dl = load_dolly(tok, batch_size=args.batch_size,
+                            seq_len=args.seq_len, max_examples=args.max_tokens)
+        elif args.sft_dataset == "openhermes":
+            print("Loading OpenHermes 2.5 dataset...")
+            dl = load_openhermes(tok, batch_size=args.batch_size,
+                                 seq_len=args.seq_len,
+                                 max_examples=args.max_tokens)
+        else:
+            ap.error("--sft requires --sft-data or --sft-dataset")
+    else:
+        from .data import load_wikitext, load_dataset_by_name
+        print(f"Loading dataset: {args.dataset}")
+        if args.dataset == "wikitext":
+            dl = load_wikitext(tok, batch_size=args.batch_size,
+                               seq_len=args.seq_len, max_tokens=args.max_tokens)
+        else:
+            dl = load_dataset_by_name(args.dataset, tok,
+                                      batch_size=args.batch_size,
+                                      seq_len=args.seq_len,
+                                      text_key=args.text_key,
+                                      max_tokens=args.max_tokens)
 
     # --- Optimizer ---
     optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr,
                                   weight_decay=0.01)
 
     # --- Train ---
-    print(f"\nStarting distillation: {args.max_steps} steps, "
+    mode_str = "SFT" if args.sft else "distillation"
+    print(f"\nStarting {mode_str}: {args.max_steps} steps, "
           f"batch={args.batch_size}, seq={args.seq_len}, "
           f"grad_accum={args.grad_accum}")
-    if teacher_device != student_device:
-        print(f"  topk={args.topk}")
     print(f"Effective batch size: {args.batch_size * args.grad_accum}\n")
 
     train(
         student, teacher, dl, optimizer,
         teacher_device=teacher_device,
         student_device=student_device,
+        sft_mode=args.sft,
         topk=args.topk,
         alpha=args.alpha,
         temperature=args.temperature,

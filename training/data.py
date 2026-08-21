@@ -64,8 +64,8 @@ def load_wikitext(tokenizer, batch_size=4, seq_len=1024, split="train",
                   max_tokens=None):
     """Load WikiText-103-raw-v1 and return a DataLoader."""
     from datasets import load_dataset
-    raw = load_dataset("wikitext", "wikitext-103-raw-v1", split=split,
-                       streaming=True, trust_remote_code=True)
+    raw = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1",
+                       split=split, streaming=True)
     return make_dataloader(raw, tokenizer, batch_size=batch_size,
                            seq_len=seq_len, split=split, max_tokens=max_tokens)
 
@@ -74,8 +74,7 @@ def load_dataset_by_name(name, tokenizer, batch_size=4, seq_len=1024,
                          split="train", text_key="text", max_tokens=None):
     """Load any HF dataset by name. Returns a DataLoader."""
     from datasets import load_dataset
-    raw = load_dataset(name, split=split, streaming=True,
-                       trust_remote_code=True)
+    raw = load_dataset(name, split=split, streaming=True)
     return make_dataloader(raw, tokenizer, batch_size=batch_size,
                            seq_len=seq_len, split=split, text_key=text_key,
                            max_tokens=max_tokens)

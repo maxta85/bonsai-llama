@@ -33,7 +33,7 @@ bonsai-quantize = "bonsai_tensor.cli:quantize_main"
 bonsai-distill = "training.distill:main"
 
 [tool.setuptools.packages.find]
-where = ["python", "training"]
+where = ["python", "."]
 include = ["bonsai_tensor*", "training*"]
 
 [tool.pytest.ini_options]
