@@ -333,10 +333,23 @@ def main() -> None:
     ap.add_argument("--out", default="bonsai-distilled")
     ap.add_argument("--save-every", type=int, default=200)
     ap.add_argument("--log-every", type=int, default=10)
+    # Memory optimization
+    ap.add_argument("--fp8", action="store_true",
+                    help="use FP8 tensor cores for matmul (Blackwell/Hopper, "
+                         "30%% less memory, ~1.1x speed)")
+    ap.add_argument("--8bit-adam", action="store_true",
+                    help="use 8-bit AdamW (75%% less optimizer memory)")
+    ap.add_argument("--grad-checkpoint", action="store_true",
+                    help="gradient checkpointing (90%% less activation memory, "
+                         "~20%% slower)")
     args = ap.parse_args()
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    from .bit_linear import replace_linears_with_bitlinear
+    if args.fp8:
+        from .mxfp4_linear import replace_linears_with_mxfp4 as replace_fn
+        print("  Using FP8 tensor core acceleration (Blackwell)")
+    else:
+        from .bit_linear import replace_linears_with_bitlinear as replace_fn
 
     teacher_device = torch.device(args.teacher_device)
     student_device = torch.device(args.student_device)
@@ -371,12 +384,15 @@ def main() -> None:
     print(f"Loading student: {student_id} (fp32, BitLinear mode={args.mode})")
     student = AutoModelForCausalLM.from_pretrained(
         student_id, torch_dtype=torch.float32)
-    n = replace_linears_with_bitlinear(student, mode=args.mode)
+    n = replace_fn(student, mode=args.mode)
     print(f"  replaced {n} Linear layers with BitLinear")
     student.to(student_device)
     if student_device.type == "cuda":
         s_mem = torch.cuda.memory_allocated(student_device) / 1e9
         print(f"  student on {student_device}, {s_mem:.1f} GB allocated")
+    if args.grad_checkpoint:
+        student.gradient_checkpointing_enable()
+        print("  gradient checkpointing enabled (saves activation memory)")
 
     # --- Data ---
     if args.sft:
@@ -418,8 +434,14 @@ def main() -> None:
                                       max_tokens=args.max_tokens)
 
     # --- Optimizer ---
-    optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr,
-                                  weight_decay=0.01)
+    if getattr(args, "8bit_adam", False):
+        import bitsandbytes as bnb
+        optimizer = bnb.optim.AdamW8bit(student.parameters(), lr=args.lr,
+                                         weight_decay=0.01)
+        print("  using 8-bit AdamW (75% less optimizer memory)")
+    else:
+        optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr,
+                                      weight_decay=0.01)
 
     # --- Train ---
     mode_str = "SFT" if args.sft else "distillation"
