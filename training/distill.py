@@ -4,24 +4,22 @@ Loss = alpha * CE(student, labels) + (1 - alpha) * KL(student || teacher)
 with temperature `T` on the KL term, following Hinton et al. (2015) and the
 "Training 1.58bit LLMs via Distillation" recipe.
 
-Multi-GPU setup
----------------
-Designed for asymmetric multi-GPU:
-  - Teacher on a large GPU (e.g. 96GB Blackwell) — only forward passes.
-  - Student on a smaller GPU (e.g. 12GB 3060) — forward + backward + optimizer.
+Two GPU modes
+-------------
+Single-GPU (default, faster for small models):
+  Both teacher and student on the same GPU. Uses full-vocab KL (exact, no
+  approximation). Best when both models fit in VRAM — e.g. Qwen3-1.7B
+  teacher + Qwen3-0.6B student on a 96GB card.
 
-The teacher's full logits (batch, seq, vocab) are too large to transfer every
-step (e.g. 151k vocab * 1024 seq * 4 batch * 4 bytes = 2.5GB). We use
-**top-k logit distillation**: keep only the top-k teacher probabilities per
-position, transfer ~k*seq*batch floats instead of vocab*seq*batch. Quality
-loss is negligible for k=50-100.
+Multi-GPU (for when the student won't fit alongside the teacher):
+  Teacher on a large GPU (e.g. 96GB Blackwell), student on a smaller one
+  (e.g. 12GB 3060). Uses top-k logit distillation: transfers only the top-k
+  teacher probabilities per position (~50x less PCIe traffic than full vocab).
 
 Reference teacher
 -----------------
-`microsoft/bitnet-b1.58-2B-4T-bf16` (the BF16 master-weights variant of the
-official BitNet b1.58 2B model) can be used as a *ternary-aware* teacher: it
-already produces ternary logits, so distilling into it transfers the
-quantized representation directly. See docs/bitnet-2b.md.
+`microsoft/bitnet-b1.58-2B-4T-bf16` can be used as a ternary-aware teacher.
+See docs/bitnet-2b.md.
 """
 
 from __future__ import annotations
@@ -37,10 +35,37 @@ import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
-# Loss
+# Loss functions
 # ---------------------------------------------------------------------------
 
-def distillation_loss(
+def distillation_loss_full(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    alpha: float = 0.5,
+    temperature: float = 2.0,
+) -> torch.Tensor:
+    """CE + full-vocab temperature-scaled KL (exact, no approximation).
+
+    Use when teacher and student are on the same device.
+    """
+    ce = F.cross_entropy(
+        student_logits.reshape(-1, student_logits.size(-1)),
+        labels.reshape(-1),
+        ignore_index=-100,
+    )
+    sl = student_logits / temperature
+    tl = teacher_logits / temperature
+    kl = F.kl_div(
+        F.log_softmax(sl, dim=-1),
+        F.softmax(tl, dim=-1),
+        reduction="batchmean",
+    ) * (temperature * temperature)
+    return alpha * ce + (1.0 - alpha) * kl
+
+
+def distillation_loss_topk(
     student_logits: torch.Tensor,
     teacher_topk_indices: torch.Tensor,
     teacher_topk_probs: torch.Tensor,
@@ -49,53 +74,44 @@ def distillation_loss(
     alpha: float = 0.5,
     temperature: float = 2.0,
 ) -> torch.Tensor:
-    """CE + top-k temperature-scaled KL.
+    """CE + top-k temperature-scaled KL (approximation for multi-GPU).
 
-    student_logits: (B, T, V) — full student logits on the student device.
-    teacher_topk_indices: (B, T, k) — indices of the teacher's top-k logits.
-    teacher_topk_probs: (B, T, k) — corresponding softmax probs (already
-        temperature-scaled and softmaxed on the teacher device).
-    labels: (B, T)
+    Only the teacher's top-k logits are used, renormalized to sum to 1.
     """
-    # Cross-entropy on hard labels.
     ce = F.cross_entropy(
         student_logits.reshape(-1, student_logits.size(-1)),
         labels.reshape(-1),
         ignore_index=-100,
     )
-
-    # Top-k KL: gather student logits at the teacher's top-k indices, compute
-    # KL(teacher || student) restricted to those k classes (renormalized).
-    B, T, V = student_logits.shape
-    k = teacher_topk_indices.size(-1)
-
-    sl = student_logits / temperature  # (B, T, V)
-    sl_topk = torch.gather(sl, dim=-1, index=teacher_topk_indices)  # (B, T, k)
-    log_sl_topk = F.log_softmax(sl_topk, dim=-1)  # (B, T, k)
+    sl = student_logits / temperature
+    sl_topk = torch.gather(sl, dim=-1, index=teacher_topk_indices)
+    log_sl_topk = F.log_softmax(sl_topk, dim=-1)
     kl = F.kl_div(log_sl_topk, teacher_topk_probs, reduction="batchmean")
     kl = kl * (temperature * temperature)
-
     return alpha * ce + (1.0 - alpha) * kl
 
 
 # ---------------------------------------------------------------------------
-# Teacher (runs on the big GPU)
+# Teacher forwards
 # ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def teacher_forward_full(teacher: nn.Module, input_ids: torch.Tensor):
+    """Run teacher, return full logits (B, T, V). Same-device only."""
+    teacher.eval()
+    out = teacher(input_ids)
+    return out.logits if hasattr(out, "logits") else out[0]
+
 
 @torch.no_grad()
 def teacher_forward_topk(teacher: nn.Module, input_ids: torch.Tensor,
                          topk: int = 50, temperature: float = 2.0):
-    """Run the teacher and return top-k indices + temperature-scaled probs.
-
-    Returns:
-        topk_indices: (B, T, k) long tensor
-        topk_probs: (B, T, k) float tensor (softmax over the k classes)
-    """
+    """Run teacher, return top-k indices + renormalized probs. Multi-GPU."""
     teacher.eval()
     out = teacher(input_ids)
     logits = out.logits if hasattr(out, "logits") else out[0]
     scaled = logits / temperature
-    probs = F.softmax(scaled, dim=-1)  # (B, T, V)
+    probs = F.softmax(scaled, dim=-1)
     topk_probs, topk_indices = torch.topk(probs, k=topk, dim=-1)
     topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
     return topk_indices, topk_probs
@@ -135,8 +151,10 @@ def train(
 ):
     """Run the distillation training loop.
 
-    Teacher stays on `teacher_device` (frozen, eval mode).
-    Student trains on `student_device` (fp32, with optimizer).
+    Single-GPU mode (teacher_device == student_device):
+        Full-vocab KL, no cross-device transfer. Fastest for small models.
+    Multi-GPU mode (different devices):
+        Top-k KL to minimize PCIe transfer.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -147,6 +165,13 @@ def train(
     teacher.to(teacher_device)
     for p in teacher.parameters():
         p.requires_grad = False
+
+    single_gpu = (teacher_device == student_device)
+    if single_gpu:
+        print("Single-GPU mode: full-vocab KL (exact distillation, no transfer)")
+    else:
+        print(f"Multi-GPU mode: top-{topk} KL (teacher={teacher_device}, "
+              f"student={student_device})")
 
     step = 0
     accum_loss = 0.0
@@ -160,25 +185,36 @@ def train(
         input_ids = batch["input_ids"]  # (B, T)
         labels = batch["labels"]        # (B, T)
 
-        # --- Teacher forward (big GPU) ---
-        teacher_input = input_ids.to(teacher_device)
-        topk_indices, topk_probs = teacher_forward_topk(
-            teacher, teacher_input, topk=topk, temperature=temperature
-        )
-        # Transfer only top-k to the student device (small: B*T*k).
-        topk_indices = topk_indices.to(student_device)
-        topk_probs = topk_probs.to(student_device)
+        if single_gpu:
+            # --- Both on same device: full-vocab KL ---
+            ids = input_ids.to(student_device)
+            lbls = labels.to(student_device)
+            with torch.no_grad():
+                t_logits = teacher_forward_full(teacher, ids)
+            s_out = student(ids)
+            s_logits = s_out.logits if hasattr(s_out, "logits") else s_out[0]
+            loss = distillation_loss_full(
+                s_logits, t_logits, lbls,
+                alpha=alpha, temperature=temperature,
+            )
+        else:
+            # --- Multi-GPU: top-k KL to minimize PCIe transfer ---
+            teacher_input = input_ids.to(teacher_device)
+            topk_indices, topk_probs = teacher_forward_topk(
+                teacher, teacher_input, topk=topk, temperature=temperature
+            )
+            topk_indices = topk_indices.to(student_device)
+            topk_probs = topk_probs.to(student_device)
 
-        # --- Student forward + loss (small GPU) ---
-        student_input = input_ids.to(student_device)
-        student_labels = labels.to(student_device)
-        s_out = student(student_input)
-        s_logits = s_out.logits if hasattr(s_out, "logits") else s_out[0]
+            student_input = input_ids.to(student_device)
+            student_labels = labels.to(student_device)
+            s_out = student(student_input)
+            s_logits = s_out.logits if hasattr(s_out, "logits") else s_out[0]
+            loss = distillation_loss_topk(
+                s_logits, topk_indices, topk_probs, student_labels,
+                alpha=alpha, temperature=temperature,
+            )
 
-        loss = distillation_loss(
-            s_logits, topk_indices, topk_probs, student_labels,
-            alpha=alpha, temperature=temperature,
-        )
         (loss / grad_accum).backward()
         accum_loss += loss.item()
 
@@ -187,7 +223,6 @@ def train(
             lr = get_lr(step, base_lr, warmup_steps, max_steps)
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
-
             torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
             optimizer.step()
             optimizer.zero_grad()
@@ -243,11 +278,10 @@ def main() -> None:
     ap.add_argument("--text-key", default="text",
                     help="column name for text in the dataset")
     ap.add_argument("--seq-len", type=int, default=1024)
-    ap.add_argument("--batch-size", type=int, default=2)
+    ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--max-tokens", type=int, default=None,
                     help="cap on number of sequences (for quick tests)")
     # Training
-    ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--max-steps", type=int, default=1000)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--alpha", type=float, default=0.5,
@@ -256,12 +290,14 @@ def main() -> None:
     ap.add_argument("--grad-accum", type=int, default=4)
     ap.add_argument("--warmup-steps", type=int, default=50)
     ap.add_argument("--topk", type=int, default=50,
-                    help="top-k teacher logits to transfer (saves PCIe bandwidth)")
+                    help="top-k teacher logits for multi-GPU mode")
     # Devices
     ap.add_argument("--teacher-device", default="cuda:0",
-                    help="device for the teacher (e.g. cuda:0 = the 96GB card)")
-    ap.add_argument("--student-device", default="cuda:1",
-                    help="device for the student (e.g. cuda:1 = a 3060)")
+                    help="device for the teacher")
+    ap.add_argument("--student-device", default="cuda:0",
+                    help="device for the student. If same as teacher, uses "
+                         "single-GPU mode with full-vocab KL (exact, faster). "
+                         "Set to cuda:1 for multi-GPU (top-k transfer).")
     ap.add_argument("--teacher-dtype", default="bfloat16",
                     choices=["bfloat16", "float16", "float32"],
                     help="teacher precision (bf16 saves VRAM)")
@@ -286,7 +322,7 @@ def main() -> None:
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    # --- Load teacher (frozen, on the big GPU) ---
+    # --- Load teacher (frozen) ---
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16,
                  "float32": torch.float32}
     t_dtype = dtype_map[args.teacher_dtype]
@@ -301,7 +337,7 @@ def main() -> None:
         t_mem = torch.cuda.memory_allocated(teacher_device) / 1e9
         print(f"  teacher on {teacher_device}, {t_mem:.1f} GB allocated")
 
-    # --- Load student (same arch, BitLinear replacement) ---
+    # --- Load student (BitLinear replacement) ---
     student_id = args.student or args.teacher
     print(f"Loading student: {student_id} (fp32, BitLinear mode={args.mode})")
     student = AutoModelForCausalLM.from_pretrained(
@@ -332,7 +368,9 @@ def main() -> None:
     # --- Train ---
     print(f"\nStarting distillation: {args.max_steps} steps, "
           f"batch={args.batch_size}, seq={args.seq_len}, "
-          f"grad_accum={args.grad_accum}, topk={args.topk}")
+          f"grad_accum={args.grad_accum}")
+    if teacher_device != student_device:
+        print(f"  topk={args.topk}")
     print(f"Effective batch size: {args.batch_size * args.grad_accum}\n")
 
     train(
@@ -352,10 +390,10 @@ def main() -> None:
         tokenizer=tok,
     )
 
+    fmt = "q1_0" if args.mode == "1b" else "q2_0"
     print(f"\nNext: export to GGUF with:")
     print(f"  python -m training.export_gguf --model {args.out} "
-          f"--format {'q1_0' if args.mode == '1b' else 'q2_0'} "
-          f"--out {args.out}.gguf")
+          f"--format {fmt} --out {args.out}.gguf")
 
 
 if __name__ == "__main__":
