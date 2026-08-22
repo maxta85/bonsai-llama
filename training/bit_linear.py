@@ -81,10 +81,17 @@ class BitLinear(nn.Module):
         return w_q * scale
 
     def forward(self, x):
+        # BitNet: LayerNorm the input, clip, then quantized matmul.
         x = F.layer_norm(x, (x.shape[-1],))
         x = torch.clamp(x, -self.input_clip, self.input_clip)
         w_q = self._quantize_weight()
-        return F.linear(x, w_q, self.bias)
+        # Cast quantized weight to input dtype for the matmul.
+        # Master weight stays FP32 (for optimizer/STE), but the actual
+        # matmul runs in the input dtype (BF16 on T4, FP32 on 6000).
+        # This halves activation memory on BF16 hardware.
+        w_q = w_q.to(x.dtype)
+        bias = self.bias.to(x.dtype) if self.bias is not None else None
+        return F.linear(x, w_q, bias)
 
     def extra_repr(self):
         return (f"in_features={self.in_features}, out_features={self.out_features}, "
