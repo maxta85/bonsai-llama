@@ -1,61 +1,121 @@
 #!/bin/bash
-# Switch the Colab CLI to a different Google account.
-# Usage: ./scripts/colab_account.sh <account_number>
-#   ./scripts/colab_account.sh 1    # switch to account 1
-#   ./scripts/colab_account.sh 2    # switch to account 2
+# Manage multiple Google Colab CLI accounts.
 #
-# Tokens are stored in .env (gitignored).
-# The script swaps the refresh token in ~/.config/colab-cli/token.json
+# Usage:
+#   ./scripts/colab_account.sh save <N>    Save current token as account N
+#   ./scripts/colab_account.sh <N>         Switch to account N
+#   ./scripts/colab_account.sh list        List all saved accounts
+#   ./scripts/colab_account.sh current     Show which account is active
+#   ./scripts/colab_account.sh new <N>     Start auth flow for account N
+#
+# Tokens are stored in ~/.config/colab-cli/tokens/account_N.json
+# The active token is symlinked at ~/.config/colab-cli/token.json
 
 set -euo pipefail
 
-ACCT="${1:-1}"
+COLAB_DIR="$HOME/.config/colab-cli"
+TOKEN_DIR="$COLAB_DIR/tokens"
+TOKEN_FILE="$COLAB_DIR/token.json"
 ENV_FILE="$(dirname "$0")/../.env"
-TOKEN_FILE="$HOME/.config/colab-cli/token.json"
 
-if [ ! -f "$ENV_FILE" ]; then
-    echo "Error: .env not found at $ENV_FILE"
-    exit 1
-fi
+mkdir -p "$TOKEN_DIR"
 
-# Load the token for this account
-TOKEN_VAR="COLAB_REFRESH_TOKEN_${ACCT}"
-REFRESH_TOKEN=$(grep "^${TOKEN_VAR}=" "$ENV_FILE" | cut -d'=' -f2-)
+cmd="${1:-list}"
 
-if [ -z "$REFRESH_TOKEN" ]; then
-    echo "Error: $TOKEN_VAR not set in .env"
-    echo "To add account $ACCT:"
-    echo "  1. Run: colab new --gpu T4 -s acct${ACCT}"
-    echo "  2. Authenticate in browser"
-    echo "  3. Copy refresh_token from $TOKEN_FILE"
-    echo "  4. Add to .env: COLAB_REFRESH_TOKEN_${ACCT}=<token>"
-    exit 1
-fi
+case "$cmd" in
+    list)
+        echo "Saved Colab accounts:"
+        echo "───────────────────────────────────────"
+        if [ ! -d "$TOKEN_DIR" ] || [ -z "$(ls -A "$TOKEN_DIR" 2>/dev/null)" ]; then
+            echo "  (none yet)"
+        else
+            for f in "$TOKEN_DIR"/account_*.json; do
+                [ -f "$f" ] || continue
+                acct=$(basename "$f" .json)
+                # Get refresh token (truncated) and check if it's the active one
+                rt=$(python3 -c "import json; d=json.load(open('$f')); print(d.get('refresh_token','')[:20])" 2>/dev/null || echo "?")
+                active=""
+                if [ -L "$TOKEN_FILE" ] && [ "$(readlink -f "$TOKEN_FILE")" = "$(readlink -f "$f")" ]; then
+                    active=" ← ACTIVE"
+                fi
+                echo "  $acct  token=${rt}...${active}"
+            done
+        fi
+        echo ""
+        # Also check if there's an unsaved active token
+        if [ -f "$TOKEN_FILE" ] && [ ! -L "$TOKEN_FILE" ]; then
+            echo "  ⚠ token.json exists but is NOT saved to any account"
+            echo "    Run: ./scripts/colab_account.sh save <N>"
+        fi
+        ;;
 
-# Load client ID/secret
-CLIENT_ID=$(grep "^COLAB_CLIENT_ID=" "$ENV_FILE" | cut -d'=' -f2-)
-CLIENT_SECRET=$(grep "^COLAB_CLIENT_SECRET=" "$ENV_FILE" | cut -d'=' -f2-)
+    current)
+        if [ -L "$TOKEN_FILE" ]; then
+            target=$(readlink "$TOKEN_FILE")
+            acct=$(basename "$target" .json)
+            echo "Active account: $acct"
+        elif [ -f "$TOKEN_FILE" ]; then
+            echo "Active token: token.json (not saved to any account)"
+            echo "Run: ./scripts/colab_account.sh save <N>"
+        else
+            echo "No active token"
+        fi
+        ;;
 
-if [ -z "$CLIENT_ID" ] || [ -z "$CLIENT_SECRET" ]; then
-    echo "Error: COLAB_CLIENT_ID or COLAB_CLIENT_SECRET not set in .env"
-    exit 1
-fi
+    save)
+        acct_num="${2:?Usage: colab_account.sh save <N>}"
+        target="$TOKEN_DIR/account_${acct_num}.json"
+        if [ ! -f "$TOKEN_FILE" ]; then
+            echo "Error: No active token at $TOKEN_FILE"
+            echo "Authenticate first: colab new --gpu T4 -s acct${acct_num}"
+            exit 1
+        fi
+        # Copy current token to account file
+        cp "$TOKEN_FILE" "$target"
+        # Symlink so it's now the active account
+        rm -f "$TOKEN_FILE"
+        ln -s "$target" "$TOKEN_FILE"
+        echo "Saved current token as account_${acct_num}"
+        echo "Active account: account_${acct_num}"
+        ;;
 
-# Write the token file for this account
-mkdir -p "$(dirname "$TOKEN_FILE")"
-cat > "$TOKEN_FILE" <<JSON
-{
-  "token": "",
-  "refresh_token": "$REFRESH_TOKEN",
-  "token_uri": "https://oauth2.googleapis.com/token",
-  "client_id": "$CLIENT_ID",
-  "client_secret": "$CLIENT_SECRET",
-  "scopes": ["openid", "https://www.googleapis.com/auth/userinfo.profile", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/colaboratory", "https://www.googleapis.com/auth/drive.file"],
-  "universe_domain": "googleapis.com",
-  "account": "",
-  "expiry": "2020-01-01T00:00:00Z"
-}
-JSON
+    new)
+        acct_num="${2:?Usage: colab_account.sh new <N>}"
+        # Remove symlink so CLI creates a fresh token
+        rm -f "$TOKEN_FILE"
+        echo "Starting auth flow for account ${acct_num}..."
+        echo "After authenticating, run: ./scripts/colab_account.sh save ${acct_num}"
+        echo ""
+        # Now run colab new which will prompt for auth
+        exec colab new --gpu T4 -s "acct${acct_num}"
+        ;;
 
-echo "Switched to Colab account $ACCT"
-echo "The CLI will refresh the access token on next use."
+    [0-9]*)
+        acct_num="$cmd"
+        target="$TOKEN_DIR/account_${acct_num}.json"
+        if [ ! -f "$target" ]; then
+            echo "Error: account_${acct_num} not found"
+            echo "To create it: ./scripts/colab_account.sh new ${acct_num}"
+            echo ""
+            echo "Available accounts:"
+            exec "$0" list
+            exit 1
+        fi
+        rm -f "$TOKEN_FILE"
+        ln -s "$target" "$TOKEN_FILE"
+        echo "Switched to account_${acct_num}"
+        # Verify it works
+        echo "Active sessions:"
+        colab sessions 2>/dev/null || echo "(CLI will refresh token on next use)"
+        ;;
+
+    *)
+        echo "Usage:"
+        echo "  $0 save <N>     Save current token as account N"
+        echo "  $0 <N>          Switch to account N"
+        echo "  $0 list         List all saved accounts"
+        echo "  $0 current      Show active account"
+        echo "  $0 new <N>      Start auth flow for account N"
+        exit 1
+        ;;
+esac
