@@ -12,3 +12,11 @@ training-data/
 bonsai-poc/
 bonsai-real-run/
 bonsai-sft-test/
+bonsai-checkpoint/
+bonsai-chat/
+bonsai-overnight-*/
+bonsai-mem-test/
+bonsai-topk-test/
+bonsai-chunked-test/
+*.bin
+*.safetensors
