@@ -133,6 +133,7 @@ def train(
     sft_mode: bool = False,
     topk: int = 50,
     topk_kl: bool = False,
+    chunked_loss: bool = False,
     alpha: float = 0.5,
     temperature: float = 2.0,
     grad_accum: int = 4,
@@ -163,9 +164,13 @@ def train(
 
     single_gpu = (teacher is not None and teacher_device == student_device)
     use_topk_kl = (teacher is not None) and ((not single_gpu) or topk_kl)
+    use_chunked = chunked_loss and use_topk_kl and not sft_mode
 
     if sft_mode:
         print("SFT mode: pure CE on assistant tokens (loss-masked)")
+    elif use_chunked:
+        print(f"Single-GPU mode: chunked CE + top-{topk} KL "
+              f"(no full vocab logits, max memory savings)")
     elif single_gpu and topk_kl:
         print(f"Single-GPU mode: top-{topk} KL (memory-efficient, "
               f"~14GB less than full-vocab)")
@@ -197,6 +202,32 @@ def train(
             s_logits = s_out.logits if hasattr(s_out, "logits") else s_out[0]
             loss = sft_loss(s_logits, lbls)
 
+        elif use_chunked:
+            # --- Chunked CE + top-k KL (no full vocab logits at all) ---
+            # Student base model produces hidden states (B, T, H), then the
+            # loss is computed by iterating over vocab chunks. Never
+            # materializes the (B, T, 151936) logits tensor.
+            from .chunked_loss import chunked_ce_and_topk_kl, get_hidden_states
+            teacher_input = input_ids.to(teacher_device)
+            am_t = attention_mask.to(teacher_device) if attention_mask is not None else None
+            with torch.no_grad():
+                topk_indices, topk_probs = teacher_forward_topk(
+                    teacher, teacher_input, topk=topk, temperature=temperature,
+                    attention_mask=am_t,
+                )
+            if not single_gpu:
+                topk_indices = topk_indices.to(student_device)
+                topk_probs = topk_probs.to(student_device)
+
+            student_input = input_ids.to(student_device)
+            student_labels = labels.to(student_device)
+            am_s = attention_mask.to(student_device) if attention_mask is not None else None
+            hidden = get_hidden_states(student, student_input, attention_mask=am_s)
+            loss = chunked_ce_and_topk_kl(
+                hidden, student.lm_head.weight, student_labels,
+                topk_indices, topk_probs,
+                alpha=alpha, temperature=temperature,
+            )
         elif use_topk_kl:
             # --- Top-k KL (single-GPU memory-efficient or multi-GPU) ---
             # Teacher produces top-k indices + probs, then we free its full
@@ -333,6 +364,9 @@ def main() -> None:
     ap.add_argument("--topk-kl", action="store_true",
                     help="use top-k KL even on single GPU (saves ~14GB of "
                          "vocab logits memory, no quality loss for k>=50)")
+    ap.add_argument("--chunked-loss", action="store_true",
+                    help="chunked CE+KL loss (avoids materializing full "
+                         "151K vocab logits, saves ~1.5GB, requires --topk-kl)")
 
     # Devices
     ap.add_argument("--teacher-device", default="cuda:0",
@@ -470,6 +504,7 @@ def main() -> None:
         sft_mode=args.sft,
         topk=args.topk,
         topk_kl=args.topk_kl,
+        chunked_loss=args.chunked_loss,
         alpha=args.alpha,
         temperature=args.temperature,
         grad_accum=args.grad_accum,
