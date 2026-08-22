@@ -132,6 +132,7 @@ def train(
     student_device: torch.device,
     sft_mode: bool = False,
     topk: int = 50,
+    topk_kl: bool = False,
     alpha: float = 0.5,
     temperature: float = 2.0,
     grad_accum: int = 4,
@@ -161,9 +162,13 @@ def train(
             p.requires_grad = False
 
     single_gpu = (teacher is not None and teacher_device == student_device)
+    use_topk_kl = (teacher is not None) and ((not single_gpu) or topk_kl)
 
     if sft_mode:
         print("SFT mode: pure CE on assistant tokens (loss-masked)")
+    elif single_gpu and topk_kl:
+        print(f"Single-GPU mode: top-{topk} KL (memory-efficient, "
+              f"~14GB less than full-vocab)")
     elif single_gpu:
         print("Single-GPU mode: full-vocab KL (exact distillation)")
     else:
@@ -192,8 +197,33 @@ def train(
             s_logits = s_out.logits if hasattr(s_out, "logits") else s_out[0]
             loss = sft_loss(s_logits, lbls)
 
-        elif single_gpu:
-            # --- Both on same device: full-vocab KL ---
+        elif use_topk_kl:
+            # --- Top-k KL (single-GPU memory-efficient or multi-GPU) ---
+            # Teacher produces top-k indices + probs, then we free its full
+            # logits immediately. Student only gathers k logits per position
+            # instead of materializing the full 151K vocab.
+            teacher_input = input_ids.to(teacher_device)
+            am_t = attention_mask.to(teacher_device) if attention_mask is not None else None
+            with torch.no_grad():
+                topk_indices, topk_probs = teacher_forward_topk(
+                    teacher, teacher_input, topk=topk, temperature=temperature,
+                    attention_mask=am_t,
+                )
+            if not single_gpu:
+                topk_indices = topk_indices.to(student_device)
+                topk_probs = topk_probs.to(student_device)
+
+            student_input = input_ids.to(student_device)
+            student_labels = labels.to(student_device)
+            am_s = attention_mask.to(student_device) if attention_mask is not None else None
+            s_out = student(student_input, attention_mask=am_s)
+            s_logits = s_out.logits if hasattr(s_out, "logits") else s_out[0]
+            loss = distillation_loss_topk(
+                s_logits, topk_indices, topk_probs, student_labels,
+                alpha=alpha, temperature=temperature,
+            )
+        else:
+            # --- Single-GPU full-vocab KL (exact, no approximation) ---
             ids = input_ids.to(student_device)
             lbls = labels.to(student_device)
             am = attention_mask.to(student_device) if attention_mask is not None else None
@@ -203,26 +233,6 @@ def train(
             s_logits = s_out.logits if hasattr(s_out, "logits") else s_out[0]
             loss = distillation_loss_full(
                 s_logits, t_logits, lbls,
-                alpha=alpha, temperature=temperature,
-            )
-        else:
-            # --- Multi-GPU: top-k KL ---
-            teacher_input = input_ids.to(teacher_device)
-            am_t = attention_mask.to(teacher_device) if attention_mask is not None else None
-            topk_indices, topk_probs = teacher_forward_topk(
-                teacher, teacher_input, topk=topk, temperature=temperature,
-                attention_mask=am_t,
-            )
-            topk_indices = topk_indices.to(student_device)
-            topk_probs = topk_probs.to(student_device)
-
-            student_input = input_ids.to(student_device)
-            student_labels = labels.to(student_device)
-            am_s = attention_mask.to(student_device) if attention_mask is not None else None
-            s_out = student(student_input, attention_mask=am_s)
-            s_logits = s_out.logits if hasattr(s_out, "logits") else s_out[0]
-            loss = distillation_loss_topk(
-                s_logits, topk_indices, topk_probs, student_labels,
                 alpha=alpha, temperature=temperature,
             )
 
@@ -320,6 +330,9 @@ def main() -> None:
     ap.add_argument("--warmup-steps", type=int, default=50)
     ap.add_argument("--topk", type=int, default=50,
                     help="top-k teacher logits for multi-GPU mode")
+    ap.add_argument("--topk-kl", action="store_true",
+                    help="use top-k KL even on single GPU (saves ~14GB of "
+                         "vocab logits memory, no quality loss for k>=50)")
 
     # Devices
     ap.add_argument("--teacher-device", default="cuda:0",
@@ -456,6 +469,7 @@ def main() -> None:
         student_device=student_device,
         sft_mode=args.sft,
         topk=args.topk,
+        topk_kl=args.topk_kl,
         alpha=args.alpha,
         temperature=args.temperature,
         grad_accum=args.grad_accum,
