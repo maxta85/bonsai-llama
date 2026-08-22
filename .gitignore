@@ -20,3 +20,4 @@ bonsai-topk-test/
 bonsai-chunked-test/
 *.bin
 *.safetensors
+.env
