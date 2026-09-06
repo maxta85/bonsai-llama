@@ -482,9 +482,12 @@ class StreamingModel(nn.Module):
                 x = self.final_norm(x)
             if self.lm_head is not None:
                 x = self.lm_head(x)
+            assert isinstance(x, torch.Tensor), (
+                "seed recompute must yield exactly one output tensor; the "
+                "grad_outputs below assume len(outputs)==1")
             outs = torch.autograd.grad(
                 outputs=[x], inputs=[leaf] + seed_inputs,
-                grad_outputs=[grad_logits] + [None] * len(seed_inputs),
+                grad_outputs=[grad_logits],
                 allow_unused=True)
             g_top = outs[0]
             # Seed-path param grads = outs[1:]; ADD to pre-tail .grad.
