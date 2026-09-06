@@ -74,7 +74,47 @@ def distillation_loss_topk(
 
 
 def sft_loss(student_logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """Pure cross-entropy on assistant tokens (labels masked with -100)."""
+    """Cross-entropy loss for SFT with an explicit causal shift.
+
+    SHIFT LOCATION BY DATA PATH (do not double-shift!):
+
+      * ``SFTDataset`` (training/sft.py): yields aligned ``input_ids[t]``
+        and ``labels[t] == input_ids[t]`` at the SAME position. The causal
+        shift happens HERE, inside the loss: logits[:, :-1] (predictions
+        from token t) are scored against labels[:, 1:] (targets at t+1).
+        The first column of the target view drops out of the pairing —
+        i.e. we predict targets 1..T-1 from positions 0..T-2 — so the
+        original label alignment is preserved modulo the shift, including
+        -100 masking (pad/prompt mask positions shift along with their
+        token ids; no extra masking needed).
+
+      * ``PackedTextDataset`` (training/data.py): already emits labels as
+        NEXT-token targets (chunk[1:]) aligned to chunk[:-1] inputs. That
+        path must NOT go through this shifted loss again — score it with
+        ``sft_loss_aligned`` (or ``F.cross_entropy`` directly), otherwise
+        every prediction would be compared against the target two steps
+        ahead.
+
+    Returns mean CE over unmasked (non -100) shifted pairs.
+    """
+    assert student_logits.ndim >= 2 and labels.shape == student_logits.shape[:2], (
+        f"sft_loss expects logits/labels with matching (B, T); got "
+        f"{tuple(student_logits.shape)} vs {tuple(labels.shape)}"
+    )
+    predictions = student_logits[:, :-1, :]
+    targets = labels[:, 1:]
+    return F.cross_entropy(
+        predictions.reshape(-1, predictions.size(-1)),
+        targets.reshape(-1),
+        ignore_index=-100,
+    )
+
+
+def sft_loss_aligned(student_logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """CE WITHOUT causal shift — for datasets whose labels are already
+    next-token targets aligned to the inputs (e.g. PackedTextDataset's
+    chunk[:-1]/chunk[1:] pairings). Never feed those through ``sft_loss``;
+    they would get shifted twice."""
     return F.cross_entropy(
         student_logits.reshape(-1, student_logits.size(-1)),
         labels.reshape(-1),

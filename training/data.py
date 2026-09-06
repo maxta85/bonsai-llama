@@ -19,6 +19,13 @@ class PackedTextDataset(IterableDataset):
     Streams the dataset, tokenizes on the fly, and concatenates tokens into
     fixed-length chunks of `seq_len`. Each sample is one chunk; the label is
     the same chunk shifted by one (standard next-token prediction).
+
+    NOTE ON CAUSAL SHIFT: this dataset ALREADY performs the shift -- it
+    emits labels == chunk[1:] (next-token targets aligned to chunk[:-1]
+    inputs). Downstream losses must consume them AS-IS (plain CE /
+    sft_loss_aligned): applying training.distill.sft_loss() here would
+    double-shift. sft_loss()'s internal shift exists for SFTDataset
+    (training/sft.py), which yields UNshifted copy-labels.
     """
 
     def __init__(self, dataset, tokenizer, seq_len=1024, split="train",
