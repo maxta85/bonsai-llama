@@ -234,14 +234,16 @@ def test_streamed_decoder_grads_match_full_load(model_pair):
     autograd pass on the unstreamed base model with all params trainable."""
     import torch as _t
     from training.layer_stream import StreamingModel
+    from copy import deepcopy
     torch.manual_seed(42)
     base = _build_tiny_llama()
     base.eval()
     dev = "cpu"
+    ref = deepcopy(base)   # independent reference — StreamingModel may mutate base
+    for pr in ref.parameters():
+        pr.requires_grad_(True)
+        pr.grad = None
     sm = StreamingModel(base, compute_device=dev)
-
-    # Unfreeze the reference model entirely and put it on the compute device.
-    ref = base
     for p in ref.parameters():
         p.requires_grad_(True)
         p.grad = None
@@ -264,11 +266,13 @@ def test_streamed_decoder_grads_match_full_load(model_pair):
     for li, fields in grads.items():
         layer_ref = ref.model.layers[li]
         for name, g in fields.items():
-            # names are like "self_attn.q_proj.weight"
-            ref_param = layer_ref
-            for part in name.split("."):
-                ref_param = getattr(ref_param, part)
-            ref_grad = ref_param.weight.grad if isinstance(ref_param, _t.nn.Linear) else ref_param.grad
+            # names end in a leaf PARAMETER name, e.g. "self_attn.q_proj.weight"
+            mod = layer_ref
+            parts = name.split(".")
+            leaf_name = parts[-1]
+            for part in parts[:-1]:
+                mod = getattr(mod, part)
+            ref_grad = getattr(mod, leaf_name).grad
             assert ref_grad is not None, f"no ref grad for layer {li} {name}"
             g_dev = g.to(dev)
             # CPU float32 vs device — tolerance for reduction-order noise

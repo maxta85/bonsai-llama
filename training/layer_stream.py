@@ -82,7 +82,13 @@ def _pick(model: nn.Module, *names):
 
 
 class _StreamTailFn(torch.autograd.Function):
-    """Identity autograd op whose backward triggers the streamed reversal."""
+    """Identity autograd op whose backward triggers the streamed reversal.
+
+    The streamed stack is graph-free by design, so `logits` arrives detached
+    (requires_grad=False) whenever residents are frozen -- and Function.apply
+    attaches NO grad_fn to such input, silently disconnecting the graph. We
+    therefore detach+require_grad the input inside forward so the tail node
+    always exists when want_ctx; reverse_backward drives all real gradients."""
 
     @staticmethod
     def forward(ctx, logits, owner):
@@ -379,6 +385,10 @@ class StreamingModel(nn.Module):
         logits = self.lm_head(post) if self.lm_head is not None else post
 
         if want_ctx:
+            # Streamed stack is graph-free, so logits may not require grad —
+            # Function.apply attaches no grad_fn then. Re-root as a leaf that
+            # requires grad so the tail node always joins the tape.
+            logits = logits.detach().requires_grad_(True)
             logits = _StreamTailFn.apply(logits, self)
             self._active_fwd = {"ctx": ctx}
         return _StreamedOutput(logits=logits)
@@ -449,28 +459,44 @@ class StreamingModel(nn.Module):
             # (LoRA). Normal autograd already accumulated their .grad up to the
             # tail op. This seed recompute must NOT touch param .grad again —
             # snapshot and restore around the call.
-            resident_grads = {}
+            resident_params = []      # (module_id, name, param) trainable residents
             for m in (self.final_norm, self.lm_head):
                 if m is not None:
                     for n, pm in m.named_parameters(recurse=True):
-                        if pm.requires_grad and pm.grad is not None:
-                            resident_grads[(id(m), n)] = pm.grad.clone()
+                        if pm.requires_grad:
+                            resident_params.append((id(m), n, pm))
+            # Snapshot pre-tail grads: since the tail re-roots the graph, normal
+            # autograd contributed grads through residents BEFORE the tail —
+            # those live in .grad now. The seed recompute must ADD its own
+            # contribution on top, not duplicate the pre-tail one.
+            pre_tail = {(mid, n): (pm.grad.clone() if pm.grad is not None else None)
+                        for mid, n, pm in resident_params}
+            # Zero .grad so autograd.grad's manual accumulation starts clean —
+            # we harvest returned values, never .grad, so this is belt+braces.
+            for _, _, pm in resident_params:
+                pm.grad = None
+            seed_inputs = [pm for _, _, pm in resident_params]
             leaf = acts[-1].detach().clone().requires_grad_(True)
             x = bl(leaf) if bl is not None else leaf
             if self.final_norm is not None:
                 x = self.final_norm(x)
             if self.lm_head is not None:
                 x = self.lm_head(x)
-            (g_top,) = torch.autograd.grad(
-                outputs=[x], inputs=[leaf], grad_outputs=[grad_logits],
+            outs = torch.autograd.grad(
+                outputs=[x], inputs=[leaf] + seed_inputs,
+                grad_outputs=[grad_logits] + [None] * len(seed_inputs),
                 allow_unused=True)
-            for m in (self.final_norm, self.lm_head):
-                if m is not None:
-                    for n, pm in m.named_parameters(recurse=True):
-                        key = (id(m), n)
-                        if pm.requires_grad:
-                            restored = resident_grads.get(key)
-                            pm.grad = restored.clone() if restored is not None else None
+            g_top = outs[0]
+            # Seed-path param grads = outs[1:]; ADD to pre-tail .grad.
+            for i, (mid, n, pm) in enumerate(resident_params):
+                seed_g = outs[1 + i]
+                pre = pre_tail.get((mid, n))
+                if seed_g is None:
+                    pm.grad = pre.clone() if pre is not None else None
+                elif pre is None:
+                    pm.grad = seed_g.detach().clone()
+                else:
+                    pm.grad = pre + seed_g.detach()
         dh_next = g_top if g_top is not None else torch.zeros_like(leaf)
         del g_top, leaf, x
 
