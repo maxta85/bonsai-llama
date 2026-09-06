@@ -445,6 +445,16 @@ class StreamingModel(nn.Module):
         # last activation. Everything above this point (lm_head etc.) already
         # ran inside normal autograd before the tail fired.
         with torch.enable_grad():
+            # IMPORTANT: residents (final_norm/lm_head) may hold trainable params
+            # (LoRA). Normal autograd already accumulated their .grad up to the
+            # tail op. This seed recompute must NOT touch param .grad again —
+            # snapshot and restore around the call.
+            resident_grads = {}
+            for m in (self.final_norm, self.lm_head):
+                if m is not None:
+                    for n, pm in m.named_parameters(recurse=True):
+                        if pm.requires_grad and pm.grad is not None:
+                            resident_grads[(id(m), n)] = pm.grad.clone()
             leaf = acts[-1].detach().clone().requires_grad_(True)
             x = bl(leaf) if bl is not None else leaf
             if self.final_norm is not None:
@@ -454,6 +464,13 @@ class StreamingModel(nn.Module):
             (g_top,) = torch.autograd.grad(
                 outputs=[x], inputs=[leaf], grad_outputs=[grad_logits],
                 allow_unused=True)
+            for m in (self.final_norm, self.lm_head):
+                if m is not None:
+                    for n, pm in m.named_parameters(recurse=True):
+                        key = (id(m), n)
+                        if pm.requires_grad:
+                            restored = resident_grads.get(key)
+                            pm.grad = restored.clone() if restored is not None else None
         dh_next = g_top if g_top is not None else torch.zeros_like(leaf)
         del g_top, leaf, x
 
@@ -483,16 +500,22 @@ class StreamingModel(nn.Module):
             if ctx.get("bitlinear_fn") is not None:
                 # Forward applied the hook to EVERY layer output; mirror it.
                 y = ctx["bitlinear_fn"](y)
-            (g,) = torch.autograd.grad(outputs=y, inputs=leaf,
-                                       grad_outputs=go, allow_unused=True)
+            s_idx = layer_idx % len(self.scratch)
+            sp = [pm for pm in self.scratch[s_idx].parameters()
+                  if pm.requires_grad]
+            grads_all = torch.autograd.grad(outputs=y, inputs=[leaf] + sp,
+                                       grad_outputs=[go] + [None] * len(sp),
+                                       allow_unused=True)
+            g = grads_all[0]
+            # autograd.grad RETURNS param grads (it never populates .grad) —
+            # harvest directly from the returned tuple. Contract, not accident.
+            pgrads = {id(pm): grads_all[1 + i] for i, pm in enumerate(sp)}
         dh = torch.zeros_like(leaf) if g is None else g.detach()
 
-        # Harvest parameter gradients accumulated inside the scratch module.
-        s_idx = layer_idx % len(self.scratch)
         snap = self.cpu_layers[layer_idx]
         gf = snap.setdefault("grad_fields", {})
         for name, param in self.scratch[s_idx].named_parameters(recurse=True):
-            gp = param.grad
+            gp = pgrads.get(id(param))
             if gp is None:
                 continue
             acc = gf.get(name)
@@ -500,7 +523,6 @@ class StreamingModel(nn.Module):
                 acc = torch.zeros(param.shape, dtype=gp.dtype)
                 gf[name] = acc
             acc.add_(gp.detach().to("cpu"))
-            param.grad = None
         for _, buf in self.scratch[s_idx].named_buffers(recurse=True):
             buf.grad = None                    # buffers carry no grads here
         return True, dh

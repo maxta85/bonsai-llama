@@ -226,3 +226,53 @@ def test_trainable_addon_receives_grad(model_pair):
             assert not p.requires_grad or p.grad is None, name
     finally:
         sm.lm_head = orig_lm_head
+
+def test_streamed_decoder_grads_match_full_load(model_pair):
+    """The core value proposition: gradients that reach streamed decoder-layer
+    weights must equal what a full-load (all-on-device) reference produces.
+    Compares per-parameter grads from streamed_grads() against a plain
+    autograd pass on the unstreamed base model with all params trainable."""
+    import torch as _t
+    from training.layer_stream import StreamingModel
+    torch.manual_seed(42)
+    base = _build_tiny_llama()
+    base.eval()
+    dev = "cpu"
+    sm = StreamingModel(base, compute_device=dev)
+
+    # Unfreeze the reference model entirely and put it on the compute device.
+    ref = base
+    for p in ref.parameters():
+        p.requires_grad_(True)
+        p.grad = None
+    ref = ref.to(dev)
+
+    _t.manual_seed(1234)
+    ids = _t.randint(0, ref.config.vocab_size, (2, 8))
+
+    # Reference: full-load forward/backward.
+    ref_out = ref(input_ids=ids.to(dev)).logits
+    ref_out.sum().backward()
+
+    # Streamed: same input, forward_with_streaming + tail-driven reverse pass.
+    out = sm.forward_with_streaming(ids)
+    out.logits.sum().backward()
+
+    grads = sm.streamed_grads()
+    assert grads, "streamed_grads() returned nothing"
+
+    for li, fields in grads.items():
+        layer_ref = ref.model.layers[li]
+        for name, g in fields.items():
+            # names are like "self_attn.q_proj.weight"
+            ref_param = layer_ref
+            for part in name.split("."):
+                ref_param = getattr(ref_param, part)
+            ref_grad = ref_param.weight.grad if isinstance(ref_param, _t.nn.Linear) else ref_param.grad
+            assert ref_grad is not None, f"no ref grad for layer {li} {name}"
+            g_dev = g.to(dev)
+            # CPU float32 vs device — tolerance for reduction-order noise
+            assert _t.allclose(g_dev, ref_grad, atol=1e-4, rtol=1e-3), (
+                f"layer {li} {name}: max diff "
+                f"{(g_dev - ref_grad).abs().max().item():.2e}"
+            )
