@@ -462,8 +462,15 @@ def main() -> None:
             s_mem = torch.cuda.memory_allocated(student_device) / 1e9
             print(f"  student on {student_device}, {s_mem:.1f} GB allocated")
     if args.grad_checkpoint:
-        student.gradient_checkpointing_enable()
-        print("  gradient checkpointing enabled (saves activation memory)")
+        if isinstance(student, StreamingModel) or stream_student is not None:
+            # StreamingModel.reverse_backward already does per-layer
+            # checkpoint-recompute (see layer_stream.gradient_checkpointing_
+            # enable) — HF grad checkpointing is neither wired nor needed.
+            print("  streaming mode: per-layer checkpoint-recompute built in; "
+                  "skipping HF gradient_checkpointing_enable()")
+        else:
+            student.gradient_checkpointing_enable()
+            print("  gradient checkpointing enabled (saves activation memory)")
 
     # --- Data ---
     if args.sft:
