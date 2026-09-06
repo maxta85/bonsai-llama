@@ -144,6 +144,7 @@ def train(
     save_every: int = 200,
     out_dir: str = "bonsai-distilled",
     tokenizer=None,
+    stream_model=None,
 ):
     """Run the training loop.
 
@@ -154,7 +155,11 @@ def train(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     student.train()
-    student.to(student_device)
+    if stream_model is None:
+        student.to(student_device)  # streamed models never move wholesale
+    else:
+        print("Layer streaming enabled: base weights stay in CPU RAM "
+              "(pinned), only embed/norm/lm_head resident on GPU.")
 
     if teacher is not None:
         teacher.eval()
@@ -389,6 +394,12 @@ def main() -> None:
     ap.add_argument("--grad-checkpoint", action="store_true",
                     help="gradient checkpointing (90%% less activation memory, "
                          "~20%% slower)")
+    ap.add_argument("--stream", action="store_true",
+                    help="layer-stream the student from CPU RAM (Soup v0.74): "
+                         "only embedding/final-norm/lm_head (+LoRA) live on "
+                         "the GPU; decoder layers stream via double-buffered "
+                         "non-blocking H2D copies each step. Implies no full "
+                         "model .to(device).")
     args = ap.parse_args()
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -433,10 +444,23 @@ def main() -> None:
         student_id, torch_dtype=torch.float32)
     n = replace_fn(student, mode=args.mode)
     print(f"  replaced {n} Linear layers with BitLinear")
-    student.to(student_device)
-    if student_device.type == "cuda":
-        s_mem = torch.cuda.memory_allocated(student_device) / 1e9
-        print(f"  student on {student_device}, {s_mem:.1f} GB allocated")
+
+    stream_student = None
+    if args.stream:
+        from .layer_stream import StreamingModel
+        # Keep the base model on CPU as pinned streaming source; residents
+        # (embed/final-norm/lm_head, where LoRA adapters would be added) go
+        # to the compute device inside StreamingModel.
+        stream_student = StreamingModel(
+            student.to("cpu"), compute_device=student_device)
+        student = stream_student
+        print(f"  streaming: {stream_student._num_layers} decoder layers "
+              f"stay in CPU RAM; residents on {student_device}")
+    else:
+        student.to(student_device)
+        if student_device.type == "cuda":
+            s_mem = torch.cuda.memory_allocated(student_device) / 1e9
+            print(f"  student on {student_device}, {s_mem:.1f} GB allocated")
     if args.grad_checkpoint:
         student.gradient_checkpointing_enable()
         print("  gradient checkpointing enabled (saves activation memory)")
@@ -501,6 +525,7 @@ def main() -> None:
         student, teacher, dl, optimizer,
         teacher_device=teacher_device,
         student_device=student_device,
+        stream_model=stream_student,
         sft_mode=args.sft,
         topk=args.topk,
         topk_kl=args.topk_kl,
