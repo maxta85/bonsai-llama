@@ -1,0 +1,46 @@
+{
+  "project": "bonsai-llama",
+  "updated": "2026-09-06",
+  "tasks": [
+    {"id": "gate-0", "title": "Executable target contract", "status": "pending",
+     "blocks": ["phase-a-ops"],
+     "acceptance": "HF revisions pinned (Qwen2.5-1.5B-Instruct, Qwen3.8-27B); Prism-ML recipe facts documented (recovery tokens, quantizer, schedule) or marked unknown; llama.cpp pinned rev confirmed to support arch + TQ1_0/TQ2_0",
+     "next_action": "curl HF API for revision hashes; check llama.cpp PRs/docs for TQ support of Qwen arch"},
+
+    {"id": "phase-a-ops", "title": "Ops layer: checkpoint/lease/manifest/shift-fix", "status": "pending",
+     "blocks": ["phase-a-run"],
+     "acceptance": "training/checkpoint.py atomic 5-min HF Hub save+load; run manifest frozen pre-launch; single-driver lease (crons enqueue only); sft_loss causal shift fixed + test asserting exactly one shift and assistant-only targets",
+     "next_action": "after gate-0"},
+
+    {"id": "phase-a-run", "title": "Phase A run: 1.5B QLoRA coherent chat", "status": "pending",
+     "blocks": ["phase-b"],
+     "acceptance": "held-out NLL improves vs untouched baseline; no general-chat regression; forced-kill + resume parity test passes; 10 frozen prompts judged coherent by Max",
+     "next_action": "after phase-a-ops; needs ultrachat_200k subset (3k convs, 70-80% general token ratio) + 60 held-out prompts"},
+
+    {"id": "dataset-general-mix", "title": "Phase A dataset: general chat mix", "status": "pending",
+     "blocks": ["phase-a-run"],
+     "acceptance": "ultrachat_200k subset downloaded (pinned revision), filtered (no malformed/empty/near-dup), token-ratio 70-80% general; 60 eval prompts disjoint; baseline generations captured BEFORE training",
+     "next_action": "can start now, independent"},
+
+    {"id": "stream-bridge", "title": "Streaming learning loop (Godmode BLOCKER)", "status": "completed",
+     "commit": "a8467d6",
+     "acceptance": "streamed updates == full-load updates (weights match after 2 AdamW steps); snapshot refresh + copy-plan invalidation; embed grad reconstruction; 11/11 tests"},
+
+    {"id": "phase-b", "title": "Phase B: 1.5B ternary QAT + export gate", "status": "pending",
+     "blocks": ["phase-c"],
+     "acceptance": "BitLinear masters update + save/reload parity; ternary vs SAME unquantized checkpoint measured (recovery curves); llama.cpp pinned-rev reference TQ1_0/TQ2_0 artifacts; custom packer byte-matrix vs quantize_row_tq*_0_ref OR upstream converter adopted; GGUF answers frozen prompts coherently",
+     "next_action": "after phase-a-run"},
+
+    {"id": "phase-c", "title": "Phase C: streaming equivalence (oracle on 0.5B)", "status": "pending",
+     "acceptance": "per-step losses, gradients, updated params, optimizer state within declared tolerances vs full-load; forced-kill recovery; measured peak VRAM/RAM. NOTE: full-load 1.5B QAT likely doesn't fit T4 (fp32 masters+moments ~24GB) — oracle on 0.5B, 1.5B vs offloaded reference",
+     "next_action": "after phase-b"},
+
+    {"id": "phase-d-resource-gate", "title": "Phase D resource gate", "status": "pending",
+     "acceptance": "measured step time, peak host/device memory, checkpoint latency, recovery-token cost for 7-8B blockwise disk-backed QAT; decision: free Colab feasible vs paid burst ($5-10 cap)",
+     "next_action": "after phase-c"},
+
+    {"id": "phase-e", "title": "Phase E: 27B", "status": "pending",
+     "acceptance": "Bonsai-27B-v2 GGUF coherent in llama.cpp on 4070 Ti; benchmarked vs Prism-ML Ternary-Bonsai-27B",
+     "next_action": "blocked until phase-d-resource-gate passes"}
+  ]
+}
