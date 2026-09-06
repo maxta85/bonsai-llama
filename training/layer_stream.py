@@ -350,6 +350,7 @@ class StreamingModel(nn.Module):
             "bitlinear_fn": bitlinear_fn,
             "acts": [],
             "pre_embed": pre_embed.detach(),
+            "ids": ids,
         }
 
         acts = ctx["acts"]
@@ -512,6 +513,9 @@ class StreamingModel(nn.Module):
 
         self._active_fwd = None
         ctx["acts"] = []
+        # expose embedding-boundary gradient for the optimizer bridge
+        self._last_dh_embed = ctx.get("dh_next")
+        self._last_ids = ctx.get("ids")
 
     def _reverse_layer_step(self, layer_idx: int, prev_act: torch.Tensor,
                             ctx: dict):
