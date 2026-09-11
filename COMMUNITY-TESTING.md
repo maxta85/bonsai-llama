@@ -38,3 +38,44 @@ Phase B recovery data plan must weight coding trajectories heavily.
 The Engram/n-gram conditional-memory idea (see Astra review + Qwen3.8-Flash-
 Next) is complementary: lookup tables handle exactness (syntax, API names,
 imports) that ternary weights struggle to encode at 1.7 bpw.
+
+## Follow-up test (same session): reasoning-block transplant
+
+Round 1: Bonsai alone produced a vanilla site — main pages only, small errors
+(broken image links, no working navigation links). Coherent but shallow.
+
+Round 2: pasted the REASONING BLOCK from Qwen3.8-Flash-Next (same prompt) into
+Bonsais
+
+## Follow-up test (same session): reasoning-block transplant
+
+Round 1: Bonsai alone produced a vanilla site — main pages only, small errors
+(broken image links, no working navigation links). Coherent but shallow.
+
+Round 2: pasted the REASONING BLOCK from Qwen3.8-Flash-Next (same prompt) into
+Bonsai's context. Result: a substantially more ambitious, impressive-but-broken
+website — bigger scope, more features, ~80 errors accumulated across ~32K
+output tokens. After hand-correcting the 80 errors the site looked genuinely
+good.
+
+## Two takeaways
+
+1. **The reasoning block transfer worked.** Bonsai's weakness is planning/
+   scope, not just precision — given Flash-Next's reasoning as scaffolding, it
+   attempted a far more ambitious build. The ternary network can EXECUTE a
+   hard plan it couldn't formulate itself.
+
+2. **Self-review pass would catch most of the 80 errors.** The errors were
+   mechanical (broken links, missing assets) — a harness loop that makes the
+   model reread its own output (or run a linter/screenshot check) before
+   finalizing would likely fix the majority. The model has the capability to
+   write good code; it lacks the second-pass discipline without a harness.
+
+## Pipeline implication
+
+A harness loop (generate -> reread -> fix -> repeat) + reasoning-scaffolding
+transplant is the practical recipe for agentic coding with Bonsai TODAY,
+before any retraining. For Bonsai-v2 QAT: training data should include
+self-correction trajectories (generate with errors -> reread -> repaired), not
+just clean code — teaching the second pass as a behavior, not hoping it
+emerges.
