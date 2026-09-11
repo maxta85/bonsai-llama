@@ -262,11 +262,24 @@ class CheckpointManager:
         return state
 
     def apply(self, state: dict[str, Any], *, model=None, optimizer=None,
-              scheduler=None, restore_rng: bool = True) -> tuple[int, Any]:
+              scheduler=None, restore_rng: bool = True,
+              dataset_hash: str | None = None) -> tuple[int, Any]:
         """Convenience wrapper: push a loaded checkpoint into live objects.
 
         Restores RNG states by default; returns ``(step, cursor)``.
+
+        If ``dataset_hash`` is provided and the checkpoint contains a
+        ``dataset_hash`` field, they must match or a ``ValueError`` is
+        raised — this prevents resuming with a different dataset.
         """
+        # Validate dataset fingerprint before touching any state.
+        ckpt_hash = state.get("dataset_hash")
+        if dataset_hash is not None and ckpt_hash is not None:
+            if dataset_hash != ckpt_hash:
+                raise ValueError(
+                    f"dataset hash mismatch: checkpoint has {ckpt_hash}, "
+                    f"but caller expected {dataset_hash}. Refusing to "
+                    f"resume with a different dataset.")
         if model is not None and state.get("weights"):
             missing, unexpected = model.load_state_dict(
                 state["weights"], strict=False)
@@ -286,11 +299,14 @@ class CheckpointManager:
     def _stage_checkpoint(self, state: dict[str, Any], step: int,
                           tmpdir: Path) -> dict[str, str]:
         """Write all artifacts into ``tmpdir`` + checksums. Returns sha map."""
-        (tmpdir / STATE_FILE).write_text(json.dumps({
+        state_json: dict[str, Any] = {
             "step": int(step),
             "tokens_consumed": _to_jsonable(state.get("tokens_consumed")),
             "cursor": _to_jsonable(state.get("cursor")),
-        }, indent=2))
+        }
+        if state.get("dataset_hash") is not None:
+            state_json["dataset_hash"] = state["dataset_hash"]
+        (tmpdir / STATE_FILE).write_text(json.dumps(state_json, indent=2))
 
         checksums: dict[str, str] = {}
 
@@ -604,7 +620,7 @@ class CheckpointManager:
 
 def build_state(model=None, *, weights: dict | None = None,
                 optimizer=None, scheduler=None, tokens_consumed: int = 0,
-                cursor: Any = None) -> dict[str, Any]:
+                cursor: Any = None, dataset_hash: str | None = None) -> dict[str, Any]:
     """Assemble a save-ready ``state`` payload from live training objects.
 
     Weight tensors are CLONED (snapshot semantics): the returned payload no
@@ -613,6 +629,12 @@ def build_state(model=None, *, weights: dict | None = None,
 
     ``weights`` wins over ``model.state_dict()`` when both given (e.g. a
     pre-extracted LoRA adapter sub-dict).
+
+    ``dataset_hash`` is an optional fingerprint of the training dataset
+    (e.g. sha256 of the tokenized data). When present in a checkpoint,
+    ``apply()`` validates that the expected hash matches the one provided
+    by the caller, rejecting mismatches to prevent silent data changes
+    across resume sessions.
     """
     if model is not None and weights is None:
         weights = {k: v.detach().cpu().clone()
@@ -640,6 +662,8 @@ def build_state(model=None, *, weights: dict | None = None,
         "cursor": cursor,
         "rng": _capture_rng_states(),
     }
+    if dataset_hash is not None:
+        state["dataset_hash"] = dataset_hash
     return state
 
 
