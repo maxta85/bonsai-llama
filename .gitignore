@@ -21,3 +21,4 @@ bonsai-chunked-test/
 *.bin
 *.safetensors
 .env
+ckpt/
