@@ -84,3 +84,6 @@ capture coherence samples, Gate A judgment by Max, then Phase B ternary work.
 - Network: whitelist proxy only (HF Hub, PyPI, GitHub) — fully isolated
 - See SANDBOX-ACCESS.md for full guide
 - Colab watcher remains as opportunistic fallback; sandbox is primary
+- RUN 1 RESULT (2026-09-13 night): final loss 1.87 avg 2.03 — beats Colab T4 (2.17). bf16 required.
+- Final adapter: sandbox ~/ckpt-trainer/final (NOT on Hub — create_repo NameError after save, bug fixed+pushed same night)
+- Morning queue: upload final → Hub, GGUF export, first chat test
