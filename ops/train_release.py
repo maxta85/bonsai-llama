@@ -153,6 +153,7 @@ def main():
         MODEL_NAME,
         torch_dtype=torch.float16,
         device_map={"": 0},
+        attn_implementation="eager",
     )
 
     # --- LoRA ---
@@ -351,6 +352,7 @@ def _upload_release(final_dir: Path, hub_repo: str, hf_token: str,
     timestamp = int(time.time())
     release_dir = f"releases/{timestamp}"
 
+    from huggingface_hub import create_repo
     create_repo(hub_repo, private=True, exist_ok=True, token=hf_token)
 
     upload_folder(
