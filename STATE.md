@@ -77,3 +77,10 @@ capture coherence samples, Gate A judgment by Max, then Phase B ternary work.
   (dataset), /content/train.log (live log), /content/ckpt (local fallback)
 - Add account: ~/.config/colab-cli/add-account.sh (browser must be signed OUT
   or incognito — otherwise it re-auths the current account)
+## GPU Sandbox (2026-09-13)
+- Local GPU training sandbox operational on apiserver (RTX 3060 12GB)
+- Replaces flaky Colab T4s as primary training substrate
+- Access: `ssh bonsai-sandbox` from this devcontainer (user train, key-based)
+- Network: whitelist proxy only (HF Hub, PyPI, GitHub) — fully isolated
+- See SANDBOX-ACCESS.md for full guide
+- Colab watcher remains as opportunistic fallback; sandbox is primary
